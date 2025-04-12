@@ -1,83 +1,125 @@
-import hashlib
-texto = "olá"
-for i in range(100):
-    hash_sha256 = hashlib.sha256(texto.encode('utf-8')).hexdigest()
-    print(hash_sha256)
+import os
+import json
+from dotenv import load_dotenv
 
-
-from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
+from twisted.internet import reactor
+from twisted.internet.defer import inlineCallbacks
+from twisted.internet.protocol import ReconnectingClientFactory
+from twisted.protocols.basic import LineReceiver
 import hashlib
-import time
+import binascii
 import struct
 
-# Configuração do RPC (conexão com o bitcoind)
-rpc_user = "seu_usuario"
-rpc_password = "sua_senha"
-rpc_connection = AuthServiceProxy(f"http://{rpc_user}:{rpc_password}@127.0.0.1:8332")
+load_dotenv(override=True)
 
-def mine_block():
-    print("Iniciando mineração Bitcoin real...")
-    
-    # Passo 1: Pega um novo endereço para a recompensa
-    wallet_address = rpc_connection.getnewaddress()
-    print(f"Recompensa será enviada para: {wallet_address}")
+class StratumProtocol(LineReceiver):
+    def __init__(self):
+        self.current_job = None
+        self.extra_nonce = None
+        self.difficulty = 1
 
-    # Passo 2: Pega transações não confirmadas (mempool)
-    tx_ids = rpc_connection.getrawmempool()
-    raw_txs = [rpc_connection.getrawtransaction(tx_id) for tx_id in tx_ids]
-    
-    # Passo 3: Cria o bloco candidato
-    block_template = rpc_connection.getblocktemplate()
-    version = block_template["version"]
-    previous_hash = block_template["previousblockhash"]
-    timestamp = block_template["curtime"]
-    bits = block_template["bits"]
-    coinbase_tx = block_template["coinbasetxn"]["data"]
-
-    # Passo 4: Calcula o Merkle Root (simplificado)
-    tx_hashes = [hashlib.sha256(bytes.fromhex(tx)).digest() for tx in raw_txs]
-    merkle_root = hashlib.sha256(hashlib.sha256(b''.join(tx_hashes)).digest())
-
-    # Passo 5: Mineração (busca por um nonce válido)
-    nonce = 0
-    max_nonce = 100000000  # Limite para evitar loop infinito
-    target = (1 << (256 - int(bits, 16)))  # Dificuldade atual
-    
-    print(f"Alvo (dificuldade): {target}")
-    print("Começando a minerar... (Ctrl+C para parar)")
-
-    while nonce < max_nonce:
-        # Monta o cabeçalho do bloco
-        header = (
-            struct.pack("<L", version) +
-            bytes.fromhex(previous_hash)[::-1] +
-            merkle_root[::-1] +
-            struct.pack("<LL", timestamp, int(bits, 16)) +
-            struct.pack("<L", nonce)
+    def connectionMade(self):
+        print("[+] Conectado à pool. Autenticando...")
+        # Envia subscription request
+        self.sendLine(b'{"id": 1, "method": "mining.subscribe", "params": []}')
+        # Envia autorização
+        self.sendLine(
+            b'{"id": 2, "method": "mining.authorize", "params": ["'
+            + os.getenv('BITCOIN_ADDRESS').encode()
+            + b'", "'
+            + os.getenv('WORKER_PASSWORD').encode()
+            + b'"]}'
         )
 
-        # Calcula o hash do bloco
-        block_hash = hashlib.sha256(hashlib.sha256(header)).digest()[::-1]
-        hash_int = int.from_bytes(block_hash, byteorder='big')
+    def lineReceived(self, line):
+        data = line.decode().strip()
+        print(f"[Dados recebidos] {data}")
 
-        # Verifica se o hash é válido
-        if hash_int < target:
-            print(f"\nBloco minerado com sucesso! Nonce: {nonce}")
-            print(f"Hash do bloco: {block_hash.hex()}")
-            
-            # Transmite o bloco para a rede
-            block_hex = rpc_connection.submitblock(header.hex())
-            if block_hex is None:
-                print("Bloco aceito pela rede! Recompensa creditada.")
-            else:
-                print(f"Erro ao transmitir bloco: {block_hex}")
-            
-            return block_hash.hex()
+        try:
+            msg = json.loads(data)
+            method = msg.get("method")
+            params = msg.get("params")
 
-        nonce += 1
+            # Recebeu um novo trabalho da pool
+            if method == "mining.notify":
+                self.current_job = {
+                    "job_id": params[0],
+                    "prev_hash": params[1],
+                    "coinbase1": params[2],
+                    "coinbase2": params[3],
+                    "merkle_branch": params[4],
+                    "version": params[5],
+                    "nbits": params[6],
+                    "ntime": params[7],
+                    "clean_jobs": params[8],
+                }
+                self.extra_nonce = params[9] if len(params) > 9 else None
+                self.start_mining()
 
-    print("Fim das tentativas. Bloco não minerado.")
-    return None
+            # Dificuldade ajustada
+            elif method == "mining.set_difficulty":
+                self.difficulty = params[0]
+
+        except Exception as e:
+            print(f"[ERRO] {e}")
+
+    def start_mining(self):
+        if not self.current_job:
+            return
+
+        print("[+] Iniciando mineração...")
+        nonce = 0
+        max_nonce = 1000000  # Limite para evitar loop infinito
+
+        while nonce < max_nonce:
+            # Monta o cabeçalho do bloco (simplificado)
+            header = (
+                struct.pack("<I", int(self.current_job["version"], 16)) +
+                binascii.unhexlify(self.current_job["prev_hash"])[::-1] +
+                binascii.unhexlify(self.calculate_merkle_root())[::-1] +
+                struct.pack("<I", int(self.current_job["ntime"], 16)) +
+                struct.pack("<I", int(self.current_job["nbits"], 16)) +
+                struct.pack("<I", nonce)
+            )
+
+            # Calcula o hash SHA-256 duplo (como no Bitcoin)
+            hash_result = hashlib.sha256(hashlib.sha256(header).digest()[::-1].hex())
+
+            # Verifica se o hash atende à dificuldade
+            if self.check_hash(hash_result):
+                print(f"[+] Share encontrado! Nonce: {nonce}")
+                self.submit_share(nonce, hash_result)
+                break
+
+            nonce += 1
+
+    def calculate_merkle_root(self):
+        # Simplificação: em um caso real, calcularíamos o Merkle Root das transações
+        return self.current_job["merkle_branch"][0] if self.current_job["merkle_branch"] else "0" * 64
+
+    def check_hash(self, hash_result):
+        target = (1 << (256 - self.difficulty))  # Target simplificado
+        hash_int = int(hash_result, 16)
+        return hash_int < target
+
+    def submit_share(self, nonce, hash_result):
+        share_msg = {
+            "params": [
+                os.getenv('BITCOIN_ADDRESS'),
+                self.current_job["job_id"],
+                self.extra_nonce,
+                self.current_job["ntime"],
+                f"{nonce:08x}",
+            ],
+            "id": 3,
+            "method": "mining.submit",
+        }
+        self.sendLine(json.dumps(share_msg).encode())
+
+class StratumClientFactory(ReconnectingClientFactory):
+    protocol = StratumProtocol
 
 if __name__ == "__main__":
-    mine_block()
+    print("[*] Conectando à pool Slush Pool...")
+    reactor.connectTCP(os.getenv('POOL_HOST'), int(os.getenv('POOL_PORT')), StratumClientFactory())
+    reactor.run()
